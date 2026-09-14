@@ -1,136 +1,183 @@
+#include "gtk_progress_bar.h"
+
 #include <gtk/gtk.h>
 #include <glib.h>
-#include <string>
+
+#include <atomic>
 #include <mutex>
-#include <condition_variable>
-#include <utility>
 #include <queue>
+#include <string>
 #include <thread>
-#include <chrono>
+#include <utility>
 
-class gtkUserData{
-    public:
-    std::string win_title;
-    std::string init_label_text;
-    int pBar_init_fraction;
-    gtkUserData(std::string win, std::string lbl,int frction):win_title(win),init_label_text(lbl),pBar_init_fraction(frction){
+namespace SimpleGtkProgressBar {
+namespace {
 
-    }
+// A single queued instruction handed from the caller's thread to the GTK
+// thread. `absolute == true` sets the bar to `percent`; otherwise `percent`
+// is added to the current value.
+struct UpdateCommand {
+    bool absolute;
+    int percent;
+    bool hasLabel;
+    std::string label;
 };
-GtkApplication *app = nullptr;
-static GtkWidget *parentWindow = nullptr;
-static GtkWidget* displayLabel = nullptr;
-static GtkWidget* progressBar = nullptr;
-static GtkWidget* vBox = nullptr;
-static std::queue <std::pair<size_t,std::string>> updateQueue;
-static std::mutex qMutex;
-static bool bStopRequested = false;
-std::thread gtkMainLoopThread;
 
-static void RemoveProgressBar(){
-    bStopRequested = true; 
-    g_application_quit(G_APPLICATION(app));
+GtkApplication* gApp = nullptr;
+GtkWidget* gWindow = nullptr;
+GtkWidget* gLabel = nullptr;
+GtkWidget* gProgress = nullptr;
+
+std::thread gLoopThread;
+std::mutex gQueueMutex;
+std::queue<UpdateCommand> gQueue;
+std::atomic<bool> gStopRequested{false};
+std::atomic<bool> gActive{false};
+
+// Initial parameters consumed by the "activate" callback on the GTK thread.
+std::string gInitTitle;
+std::string gInitLabel;
+int gInitPercent = 0;
+
+int Clamp(int value) {
+    if (value < 0) return 0;
+    if (value > 100) return 100;
+    return value;
 }
 
-static void InternalProgressBarUpdate(size_t increment, std::string lableText="__DEFAULT_TEXT__"){
-    //to be called by ProcessUpdateQueue if there is data in queue
-    double curProgress = gtk_progress_bar_get_fraction(GTK_PROGRESS_BAR(progressBar));
-    curProgress +=(increment*0.1);
-    if(static_cast<int>(curProgress) >= 1){
-        curProgress = 0.9;
-    }
-    std::string curProgress_text = std::to_string(static_cast<int>(curProgress*10))+std::string("%");
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progressBar),curProgress);
-    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(progressBar), curProgress_text.c_str());
-    if(lableText != "__DEFAULT_TEXT__"){
-        gtk_label_set_text(GTK_LABEL(displayLabel),lableText.c_str());
-    }
+// GTK thread only.
+void ApplyProgress(int percent) {
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(gProgress), percent / 100.0);
+    std::string text = std::to_string(percent) + "%";
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(gProgress), text.c_str());
 }
 
-static gboolean UpdateProgressBarCallback(gpointer data){
-    if(bStopRequested){
+// Drains all queued commands. Registered with g_timeout_add, so it runs on
+// the GTK thread where touching widgets is safe.
+gboolean DrainQueue(gpointer) {
+    if (gStopRequested.load()) {
+        return G_SOURCE_REMOVE;
+    }
+
+    std::queue<UpdateCommand> pending;
+    {
+        std::lock_guard<std::mutex> lock(gQueueMutex);
+        std::swap(pending, gQueue);
+    }
+
+    while (!pending.empty()) {
+        const UpdateCommand& cmd = pending.front();
+        int current = static_cast<int>(
+            gtk_progress_bar_get_fraction(GTK_PROGRESS_BAR(gProgress)) * 100.0 + 0.5);
+        int target = cmd.absolute ? cmd.percent : current + cmd.percent;
+        ApplyProgress(Clamp(target));
+        if (cmd.hasLabel) {
+            gtk_label_set_text(GTK_LABEL(gLabel), cmd.label.c_str());
+        }
+        pending.pop();
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+// Window close button: request shutdown and let the default handler destroy
+// the window.
+gboolean OnDeleteEvent(GtkWidget*, GdkEvent*, gpointer) {
+    gStopRequested.store(true);
+    if (gApp) {
+        g_application_quit(G_APPLICATION(gApp));
+    }
+    return FALSE;
+}
+
+void OnActivate(GtkApplication* app, gpointer) {
+    gWindow = gtk_application_window_new(app);
+    gtk_window_set_title(GTK_WINDOW(gWindow), gInitTitle.c_str());
+    gtk_window_set_default_size(GTK_WINDOW(gWindow), 320, 90);
+    g_signal_connect(gWindow, "delete-event", G_CALLBACK(OnDeleteEvent), nullptr);
+
+    gLabel = gtk_label_new(gInitLabel.c_str());
+    gProgress = gtk_progress_bar_new();
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(gProgress), TRUE);
+    ApplyProgress(Clamp(gInitPercent));
+
+    GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_box_pack_start(GTK_BOX(box), gProgress, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), gLabel, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(gWindow), box);
+
+    g_timeout_add(100, DrainQueue, nullptr);
+    gtk_widget_show_all(gWindow);
+}
+
+// Entry point of the background thread: owns the GTK application lifetime.
+void RunLoop() {
+    gApp = gtk_application_new("org.simple.gtkprogressbar", G_APPLICATION_NON_UNIQUE);
+    g_signal_connect(gApp, "activate", G_CALLBACK(OnActivate), nullptr);
+    g_application_run(G_APPLICATION(gApp), 0, nullptr);
+    g_object_unref(gApp);
+    gApp = nullptr;
+    gActive.store(false);
+}
+
+// Scheduled onto the GTK thread from Destroy() so the loop quits itself
+// instead of another thread poking GTK directly.
+gboolean QuitOnGtkThread(gpointer) {
+    if (gApp) {
+        g_application_quit(G_APPLICATION(gApp));
+    }
+    return G_SOURCE_REMOVE;
+}
+
+} // namespace
+
+bool Create(const std::string& windowTitle, const std::string& initialLabel, int initialPercent) {
+    if (gActive.load()) {
         return false;
     }
-    std::unique_lock<std::mutex> qlock(qMutex);
-    while(!updateQueue.empty()){
-        auto data = updateQueue.front();
-        updateQueue.pop();
-        InternalProgressBarUpdate(data.first, data.second);
+
+    gInitTitle = windowTitle;
+    gInitLabel = initialLabel;
+    gInitPercent = initialPercent;
+    gStopRequested.store(false);
+    {
+        std::lock_guard<std::mutex> lock(gQueueMutex);
+        std::queue<UpdateCommand> empty;
+        std::swap(gQueue, empty);
     }
+
+    gActive.store(true);
+    gLoopThread = std::thread(RunLoop);
     return true;
 }
 
-static void ActivateSimpleGtkProgressBar(GtkApplication *app, gpointer user_data){
-    std::string winTtile="Default";
-    std::string labelInitText="";
-    size_t pBarInitState =0;
-    if(user_data){
-        gtkUserData* gtk_user_data = (gtkUserData*)user_data;
-        std::string winTtile= gtk_user_data->win_title;
-        std::string labelInitText = gtk_user_data->init_label_text;
-        size_t pBarInitState = gtk_user_data->pBar_init_fraction;
-    }
-
-    bStopRequested = false;
-    //parentWindow = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    parentWindow = gtk_application_window_new(app);
-    gtk_window_set_title (GTK_WINDOW (parentWindow), winTtile.c_str());
-    g_signal_connect(parentWindow,"delete-event",G_CALLBACK(RemoveProgressBar),NULL);
-    displayLabel =gtk_label_new(labelInitText.c_str());
-    progressBar = gtk_progress_bar_new();
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progressBar),static_cast<double>(pBarInitState)/10);
-    g_timeout_add (500, UpdateProgressBarCallback, nullptr);
-    vBox = gtk_box_new(GTK_ORIENTATION_VERTICAL,5);
-    gtk_box_pack_start(GTK_BOX(vBox),progressBar,0,0,0);
-    gtk_box_pack_start(GTK_BOX(vBox),displayLabel,0,0,0);
-    gtk_container_add(GTK_CONTAINER(parentWindow),vBox);
-    gtk_widget_show_all(parentWindow);
-}
-
-
-static void UpdateProgressBar(size_t increment, std::string lableText="__DEFAULT_TEXT__"){
-    if(bStopRequested){
+void Update(int incrementPercent, const std::string& labelText) {
+    if (!gActive.load()) {
         return;
     }
-    std::unique_lock<std::mutex> qlock(qMutex);
-    updateQueue.push(std::make_pair(increment,lableText));
+    std::lock_guard<std::mutex> lock(gQueueMutex);
+    gQueue.push(UpdateCommand{false, incrementPercent, !labelText.empty(), labelText});
 }
 
-static void InitializeProgressBar(int argc, char** argv, std::string win_title, std::string init_label_text, int init_pbar_fraction){
-    app = gtk_application_new("org.gtk.example", G_APPLICATION_FLAGS_NONE);
-    gtkUserData* data =new gtkUserData(win_title,init_label_text,init_pbar_fraction);
-	g_signal_connect(app, "activate", G_CALLBACK(ActivateSimpleGtkProgressBar), (gpointer)data);
-	int status = g_application_run(G_APPLICATION(app), argc, argv);
-	g_object_unref(app);
+void SetProgress(int percent, const std::string& labelText) {
+    if (!gActive.load()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(gQueueMutex);
+    gQueue.push(UpdateCommand{true, percent, !labelText.empty(), labelText});
 }
 
-static void CreateProgressBar(int argc,char** argv,std::string win, std::string lbl, int fraction){
-    gtkMainLoopThread = std::thread(&InitializeProgressBar, std::ref(argc),std::ref(argv), win,lbl, fraction);
-     
+void Destroy() {
+    if (!gLoopThread.joinable()) {
+        return;
+    }
+    gStopRequested.store(true);
+    g_idle_add(QuitOnGtkThread, nullptr);
+    gLoopThread.join();
+    gActive.store(false);
 }
 
-static void DestroyProgressBar(){
-    RemoveProgressBar();   
-    gtkMainLoopThread.join();
+bool IsActive() {
+    return gActive.load();
 }
 
-int main(int argc, char** argv){	
-    //CreateProgressBar(argc, argv,"Test", "......", 0);
-    gtkMainLoopThread = std::thread(&InitializeProgressBar, std::ref(argc),std::ref(argv), "Test", "......", 0);
-
- 	UpdateProgressBar(1,"Initializing...");
-    std::this_thread::sleep_for (std::chrono::seconds(2));
-    UpdateProgressBar(2,"In Progress...");
-    std::this_thread::sleep_for (std::chrono::seconds(2));
-    UpdateProgressBar(2,"In Progress.");
-    std::this_thread::sleep_for (std::chrono::seconds(2));
-    UpdateProgressBar(2,"In Progress...");
-    std::this_thread::sleep_for (std::chrono::seconds(2));
-    UpdateProgressBar(2,"Almost there..");
-    std::this_thread::sleep_for (std::chrono::seconds(2));
-    UpdateProgressBar(1,"Finishing...");
-    std::this_thread::sleep_for (std::chrono::seconds(2));
-
-    DestroyProgressBar();
-    return 0;
-}
+} // namespace SimpleGtkProgressBar

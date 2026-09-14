@@ -1,49 +1,45 @@
 #pragma once
 
-#include <gtk/gtk.h>
 #include <string>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <utility>
-#include <queue>
 
-namespace SimpleGtkProgressBar{
+// SimpleGtkProgressBar
+// ---------------------
+// A tiny, self-contained progress-bar widget backed by GTK3.
+//
+// The GTK event loop runs on its own background thread, so all functions
+// below are non-blocking and safe to call from an application's main thread.
+// The public interface intentionally exposes no GTK types, so consumers do
+// not need GTK headers to use the library (only to link against it).
+//
+// Typical usage:
+//     SimpleGtkProgressBar::Create("Installing", "Starting...", 0);
+//     SimpleGtkProgressBar::Update(25, "Copying files...");
+//     SimpleGtkProgressBar::SetProgress(100, "Done");
+//     SimpleGtkProgressBar::Destroy();
+namespace SimpleGtkProgressBar {
 
-    class ProgressBarUpdateData{
-    public:
-        std::queue <std::pair<size_t,std::string>>& updateMsgQueue;
-        static std::mutex qMutex;
-        GtkWidget* window;
-        GtkWidget* label;
-        ProgressBarUpdateData(std::queue <std::pair<size_t,std::string>>& msgQueue GtkWidget* win, GtkWidget* lbl):updateMsgQueue(msgQueue),window(win),label(lbl){
+// Creates and shows the progress-bar window and starts the GTK event loop on
+// a dedicated background thread. Returns false if a progress bar is already
+// active. `initialPercent` is clamped to the range [0, 100].
+bool Create(const std::string& windowTitle,
+            const std::string& initialLabel = "",
+            int initialPercent = 0);
 
-        }
-    };
+// Advances the bar by `incrementPercent` (the result is clamped to [0, 100]).
+// When `labelText` is non-empty the message label is updated too. Thread-safe;
+// a no-op when no progress bar is active.
+void Update(int incrementPercent, const std::string& labelText = "");
 
-    static GtkWidget *parentWindow = nullptr;
-    static GtkWidget* displayLabel = nullptr;
-    static GtkWidget* progressBar = nullptr;
-    static GtkWidget* vBox = nullptr;
-    static std::mutex pBarCreateMutex;
-    static SimpleGtkProgressBar* pBarInstance = nullptr;
-    //SimpleGtkProgressBar(std::string winTtile,std::string labelInitText, size_t pBarInitState);
+// Sets the bar to an absolute `percent` (clamped to [0, 100]). When
+// `labelText` is non-empty the message label is updated too. Thread-safe;
+// a no-op when no progress bar is active.
+void SetProgress(int percent, const std::string& labelText = "");
 
-    //static std::thread pBarThread;
-    static std::queue <std::pair<size_t,std::string>> updateQueue;
-    static std::mutex qMutex;
-    static std::condition_variable qCondVar;
-    static bool bStopRequested;
-    static gboolean ProcessUpdateQueue();
-    static int InternalUpdateQueue(size_t increment, std::string lableText);
-    //static void InternalProgressBarUpdate(GtkWidget* widget, gpointer data);  //if need to be passes as callback
-    static void InternalProgressBarUpdate(size_t increment, std::string lableText);
+// Closes the window, stops the GTK loop and joins the background thread.
+// Safe to call multiple times.
+void Destroy();
 
-    static bool initialized;
+// Returns true while the progress-bar window is active.
+bool IsActive();
 
-
-    static SimpleGtkProgressBar* GetProgressBar(std::string winTtile,std::string labelInitText, size_t pBarInitState);
-    static int ShowProgressBar();
-    static int UpdateProgressBar(size_t increment, std::string lableText);
-    static int RemoveProgressBar(); 
-}
+} // namespace SimpleGtkProgressBar

@@ -1,24 +1,41 @@
-
 cmake_minimum_required(VERSION 3.10)
-set (CMAKE_CXX_STANDARD 11)
 
-project(SimpleGtkProgressBar)
+project(SimpleGtkProgressBar CXX)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(GTK REQUIRED "gtk+-3.0")
+pkg_check_modules(GTK REQUIRED gtk+-3.0)
 
-
-include_directories(${CMAKE_CURRENT_LIST_DIR} ${GTK_INCLUDE_DIRS})
-
-message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-
-set(${PROJECT_NAME}_SOURCE_FILES 
-    "${CMAKE_CURRENT_LIST_DIR}/gtk_progress_bar.cpp"
+# ---------------------------------------------------------------------------
+# Static library: SimpleGtkProgressBar
+# ---------------------------------------------------------------------------
+add_library(SimpleGtkProgressBar STATIC
+    gtk_progress_bar.cpp
 )
-add_executable(${PROJECT_NAME}  ${${PROJECT_NAME}_SOURCE_FILES})
-target_link_libraries(${PROJECT_NAME} ${GTK_LIBRARIES})
 
-target_link_libraries(${PROJECT_NAME} ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(SimpleGtkProgressBar
+    PUBLIC ${CMAKE_CURRENT_LIST_DIR}
+    PUBLIC ${GTK_INCLUDE_DIRS}
+)
 
-project(LaunchProgressBarApp)
-add_executable(${PROJECT_NAME}  LaunchProgressBarApp.cpp)
+target_compile_options(SimpleGtkProgressBar PRIVATE ${GTK_CFLAGS_OTHER})
+
+# GTK lib directories (link_directories is used for CMake 3.10 compatibility).
+link_directories(${GTK_LIBRARY_DIRS})
+
+target_link_libraries(SimpleGtkProgressBar
+    PUBLIC ${GTK_LIBRARIES}
+    PUBLIC Threads::Threads
+)
+
+# ---------------------------------------------------------------------------
+# Test application: LaunchProgressBarApp (links the static library)
+# ---------------------------------------------------------------------------
+add_executable(LaunchProgressBarApp
+    LaunchProgressBarApp.cpp
+)
+
+target_link_libraries(LaunchProgressBarApp PRIVATE SimpleGtkProgressBar)
